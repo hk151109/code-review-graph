@@ -126,7 +126,9 @@ def _handle_init(args: argparse.Namespace) -> None:
     # Legacy: --skills/--hooks/--all still accepted (no-op, everything is default)
 
     from .skills import (
-        generate_skills, inject_claude_md, inject_platform_instructions,
+        generate_skills,
+        inject_claude_md,
+        inject_platform_instructions,
         install_hooks,
     )
 
