@@ -784,7 +784,6 @@ class TestLuaParsing:
         assert "test_dog_fetch" in names
         assert len(tests) == 3
 
-
     def test_extracts_params(self):
         funcs = {n.name: n for n in self.nodes if n.kind == "Function"}
         assert funcs["greet"].params is not None

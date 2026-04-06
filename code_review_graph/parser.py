@@ -12,7 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import tree_sitter_language_pack as tslp
 
@@ -1366,7 +1366,7 @@ class CodeParser:
 
         return False
 
-    def _elixir_get_call_args(self, call_node) -> list:
+    def _elixir_get_call_args(self, call_node) -> list[Any]:
         """Return logical argument nodes for an Elixir call node."""
         args: list = []
         for child in call_node.children:
@@ -1392,8 +1392,9 @@ class CodeParser:
                                 "alias", "identifier",
                             ):
                                 parts.append(arg.text.decode("utf-8", errors="replace"))
-                if parts:
-                    return ".".join(parts)
+                if not parts:
+                    return None
+                return ".".join(parts)
 
         return None
 
