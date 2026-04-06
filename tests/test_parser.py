@@ -17,6 +17,12 @@ class TestCodeParser:
     def test_detect_language_typescript(self):
         assert self.parser.detect_language(Path("foo.ts")) == "typescript"
 
+    def test_detect_language_elixir_ex(self):
+        assert self.parser.detect_language(Path("foo.ex")) == "elixir"
+
+    def test_detect_language_elixir_exs(self):
+        assert self.parser.detect_language(Path("foo.exs")) == "elixir"
+
     def test_detect_language_unknown(self):
         assert self.parser.detect_language(Path("foo.txt")) is None
 

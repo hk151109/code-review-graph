@@ -101,6 +101,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".t": "perl",
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
+    ".ex": "elixir",
+    ".exs": "elixir",
     ".ipynb": "notebook",
 }
 
@@ -136,6 +138,7 @@ _CLASS_TYPES: dict[str, list[str]] = {
     ],
     "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
     "lua": [],  # Lua has no class keyword; table-based OOP handled via constructs handler
+    "elixir": [],  # defmodule handled via _extract_elixir_constructs
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -170,6 +173,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # function_signature inside it).
     "dart": ["function_signature"],
     "lua": ["function_declaration"],
+    "elixir": [],  # def/defp handled via _extract_elixir_constructs
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -195,6 +199,7 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "dart": ["import_or_export"],
     # Lua: require() is a function_call, handled via _extract_lua_constructs
     "lua": [],
+    "elixir": [],  # import/alias/require/use handled via _extract_elixir_constructs
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -220,6 +225,7 @@ _CALL_TYPES: dict[str, list[str]] = {
     "scala": ["call_expression", "instance_expression", "generic_function"],
     "solidity": ["call_expression"],
     "lua": ["function_call"],
+    "elixir": ["call"],
 }
 
 # Patterns that indicate a test function
@@ -240,6 +246,7 @@ _TEST_FILE_PATTERNS = [
     re.compile(r".*_test\.go$"),
     re.compile(r"tests?/"),
     re.compile(r".*_test\.dart$"),
+    re.compile(r".*_test\.exs$"),
     re.compile(r"test[_-].*\.[rR]$"),
     re.compile(r"tests/testthat/"),
 ]
@@ -905,6 +912,14 @@ class CodeParser:
             ):
                 continue
 
+            # --- Elixir-specific constructs ---
+            if language == "elixir" and self._extract_elixir_constructs(
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
+            ):
+                continue
+
             # --- JS/TS variable-assigned functions (const foo = () => {}) ---
             if (
                 language in ("javascript", "typescript", "tsx")
@@ -1300,6 +1315,207 @@ class CodeParser:
     # ------------------------------------------------------------------
     # JS/TS: variable-assigned functions  (const foo = () => {})
     # ------------------------------------------------------------------
+
+    def _extract_elixir_constructs(
+        self,
+        child,
+        node_type: str,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle Elixir module/function/import constructs."""
+        if node_type != "call":
+            return False
+
+        call_name = self._get_call_name(child, language, source)
+        if not call_name:
+            return False
+
+        if call_name == "defmodule":
+            return self._handle_elixir_defmodule(
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, import_map, defined_names, _depth,
+            )
+
+        if call_name in {"def", "defp"}:
+            return self._handle_elixir_function(
+                child, source, language, file_path, nodes, edges,
+                enclosing_class, import_map, defined_names, _depth,
+            )
+
+        if not enclosing_func and call_name in {"import", "alias", "require", "use"}:
+            imports = self._extract_import(child, language, source)
+            for imp_target in imports:
+                resolved = self._resolve_module_to_file(imp_target, file_path, language)
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=resolved if resolved else imp_target,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
+            return True
+
+        return False
+
+    def _elixir_get_call_args(self, call_node) -> list:
+        """Return logical argument nodes for an Elixir call node."""
+        args: list = []
+        for child in call_node.children:
+            if child.type == "arguments":
+                args.extend(
+                    arg for arg in child.children if getattr(arg, "is_named", False)
+                )
+        return args
+
+    def _elixir_get_module_name(self, node) -> Optional[str]:
+        """Extract module name from Elixir alias-like node."""
+        if node.type in ("alias", "identifier"):
+            return node.text.decode("utf-8", errors="replace")
+
+        if node.type == "call":
+            name = self._get_call_name(node, "elixir", b"")
+            if name == "__aliases__":
+                parts: list[str] = []
+                for child in node.children:
+                    if child.type == "arguments":
+                        for arg in child.children:
+                            if getattr(arg, "is_named", False) and arg.type in (
+                                "alias", "identifier",
+                            ):
+                                parts.append(arg.text.decode("utf-8", errors="replace"))
+                if parts:
+                    return ".".join(parts)
+
+        return None
+
+    def _handle_elixir_defmodule(
+        self,
+        child,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle Elixir defmodule blocks as Class nodes."""
+        args = self._elixir_get_call_args(child)
+        if not args:
+            return False
+
+        name = self._elixir_get_module_name(args[0])
+        if not name:
+            return False
+
+        node = NodeInfo(
+            kind="Class",
+            name=name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+        )
+        nodes.append(node)
+
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path,
+            target=self._qualify(name, file_path, enclosing_class),
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
+
+        body = args[1] if len(args) > 1 else None
+        if body is not None:
+            self._extract_from_tree(
+                body, source, language, file_path, nodes, edges,
+                enclosing_class=name, enclosing_func=None,
+                import_map=import_map, defined_names=defined_names,
+                _depth=_depth + 1,
+            )
+        return True
+
+    def _handle_elixir_function(
+        self,
+        child,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle Elixir def/defp function declarations."""
+        args = self._elixir_get_call_args(child)
+        if not args:
+            return False
+
+        head = args[0]
+        func_name = self._get_call_name(head, language, source)
+        if not func_name:
+            return False
+
+        is_test = _is_test_function(func_name, file_path)
+        kind = "Test" if is_test else "Function"
+        qualified = self._qualify(func_name, file_path, enclosing_class)
+
+        params = None
+        head_args = self._elixir_get_call_args(head)
+        if head_args:
+            params = f"({', '.join(a.text.decode('utf-8', errors='replace') for a in head_args)})"
+        elif any(c.type == "arguments" for c in head.children):
+            params = "()"
+
+        node = NodeInfo(
+            kind=kind,
+            name=func_name,
+            file_path=file_path,
+            line_start=child.start_point[0] + 1,
+            line_end=child.end_point[0] + 1,
+            language=language,
+            parent_name=enclosing_class,
+            params=params,
+            is_test=is_test,
+        )
+        nodes.append(node)
+
+        container = (
+            self._qualify(enclosing_class, file_path, None)
+            if enclosing_class else file_path
+        )
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=container,
+            target=qualified,
+            file_path=file_path,
+            line=child.start_point[0] + 1,
+        ))
+
+        body = args[1] if len(args) > 1 else None
+        if body is not None:
+            self._extract_from_tree(
+                body, source, language, file_path, nodes, edges,
+                enclosing_class=enclosing_class, enclosing_func=func_name,
+                import_map=import_map, defined_names=defined_names,
+                _depth=_depth + 1,
+            )
+        return True
 
     _JS_FUNC_VALUE_TYPES = frozenset(
         {"arrow_function", "function_expression", "function"},
@@ -1991,6 +2207,27 @@ class CodeParser:
                 for child in node.children:
                     if child.type == "import_clause":
                         self._collect_js_import_names(child, module, import_map)
+        elif language == "elixir":
+            call_name = self._get_call_name(node, language, source)
+            if call_name in {"import", "alias", "require", "use"}:
+                imports = self._extract_import(node, language, source)
+                if not imports:
+                    return
+                module = imports[0]
+                args = self._elixir_get_call_args(node)
+                if call_name == "alias" and len(args) > 1 and args[1].type == "keywords":
+                    for kw in args[1].children:
+                        if (
+                            kw.type == "pair"
+                            and len(kw.children) >= 3
+                            and kw.children[0].type == "atom"
+                            and kw.children[0].text == b"as"
+                        ):
+                            alias_name = self._elixir_get_module_name(kw.children[2])
+                            if alias_name:
+                                import_map[alias_name] = module
+                                return
+                import_map[module.split(".")[-1]] = module
 
     def _collect_js_import_names(
         self, clause_node, module: str, import_map: dict[str, str],
@@ -2086,6 +2323,24 @@ class CodeParser:
                 target = base.with_suffix(".dart")
                 if target.is_file():
                     return str(target.resolve())
+        elif language == "elixir":
+            module_rel = module.replace(".", "/")
+            snake_rel = re.sub(r"(?<!^)(?=[A-Z])", "_", module_rel).lower()
+            candidates = [
+                f"{snake_rel}.ex",
+                f"{snake_rel}.exs",
+                f"lib/{snake_rel}.ex",
+                f"lib/{snake_rel}.exs",
+            ]
+            current = caller_dir
+            while True:
+                for candidate in candidates:
+                    target = current / candidate
+                    if target.is_file():
+                        return str(target.resolve())
+                if current == current.parent:
+                    break
+                current = current.parent
 
         return None
 
@@ -2400,6 +2655,14 @@ class CodeParser:
             val = _find_string_literal(node)
             if val:
                 imports.append(val)
+        elif language == "elixir":
+            call_name = self._get_call_name(node, language, source)
+            if call_name in {"import", "alias", "require", "use"}:
+                args = self._elixir_get_call_args(node)
+                if args:
+                    mod = self._elixir_get_module_name(args[0])
+                    if mod:
+                        imports.append(mod)
         else:
             # Fallback: just record the text
             imports.append(text)
@@ -2471,6 +2734,13 @@ class CodeParser:
         # R namespace-qualified call: dplyr::filter()
         if first.type == "namespace_operator":
             return first.text.decode("utf-8", errors="replace")
+
+        # Elixir module call: Foo.bar()
+        if language == "elixir" and first.type == "dot":
+            for child in reversed(first.children):
+                if child.type in ("identifier", "alias"):
+                    return child.text.decode("utf-8", errors="replace")
+            return None
 
         return None
 

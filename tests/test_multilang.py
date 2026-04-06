@@ -1,4 +1,4 @@
-"""Tests for Go, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Solidity, and Vue parsing."""
+"""Tests for Go, Rust, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift, Solidity, Vue, Elixir parsing."""
 
 from pathlib import Path
 
@@ -784,6 +784,7 @@ class TestLuaParsing:
         assert "test_dog_fetch" in names
         assert len(tests) == 3
 
+
     def test_extracts_params(self):
         funcs = {n.name: n for n in self.nodes if n.kind == "Function"}
         assert funcs["greet"].params is not None
@@ -807,3 +808,37 @@ class TestLuaParsing:
         sources = {e.source.split("::")[-1] for e in calls}
         assert "Dog.fetch" in sources  # Dog:fetch calls self:speak and print
         assert "Animal.speak" in sources  # Animal:speak calls log:info
+
+
+class TestElixirParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "sample.exs")
+
+    def test_detects_language(self):
+        assert self.parser.detect_language(Path("main.ex")) == "elixir"
+        assert self.parser.detect_language(Path("main.exs")) == "elixir"
+
+    def test_finds_module(self):
+        classes = [n for n in self.nodes if n.kind == "Class"]
+        names = {c.name for c in classes}
+        assert "TestApp" in names
+
+    def test_finds_functions(self):
+        funcs = [n for n in self.nodes if n.kind == "Function"]
+        names = {f.name for f in funcs}
+        assert "greet" in names
+        assert "sum" in names
+        assert "flatten_once" in names
+
+    def test_finds_imports(self):
+        imports = [e for e in self.edges if e.kind == "IMPORTS_FROM"]
+        targets = {e.target for e in imports}
+        assert "Enum" in targets
+        assert "List" in targets
+
+    def test_finds_calls(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert "sum" in targets
+        assert "flatten" in targets

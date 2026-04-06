@@ -199,7 +199,7 @@ def d2():
 
     boxes = [
         ("Repository",       "your code",              BLU_BG, BLU, 60),
-        ("Tree-sitter Parser","19 languages + notebooks", ORG_BG, ORG, 380),
+        ("Tree-sitter Parser","20 languages + notebooks", ORG_BG, ORG, 380),
         ("SQLite Graph",     "nodes + edges\nflows + communities",  PRP_BG, PRP, 700),
         ("Blast Radius",     "BFS traversal",           YLW_BG, YLW, 1020),
         ("Minimal Review Set","only what matters",        GRN_BG, GRN, 1380),

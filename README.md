@@ -94,10 +94,10 @@ Large monorepos are where token waste is most painful. The graph cuts through th
   <img src="diagrams/diagram6_monorepo_funnel.png" alt="Next.js monorepo: 27,732 files funnelled through code-review-graph down to ~15 files — 49x fewer tokens" width="80%" />
 </p>
 
-### 19 languages + Jupyter notebooks
+### 20 languages + Jupyter notebooks
 
 <p align="center">
-  <img src="diagrams/diagram9_language_coverage.png" alt="19 languages organized by category: Web, Backend, Systems, Mobile, Scripting, plus Jupyter/Databricks notebook support" width="90%" />
+  <img src="diagrams/diagram9_language_coverage.png" alt="20 languages organized by category: Web, Backend, Systems, Mobile, Scripting, plus Jupyter/Databricks notebook support" width="90%" />
 </p>
 
 Full Tree-sitter grammar support for functions, classes, imports, call sites, inheritance, and test detection in every language. Plus Jupyter/Databricks notebook parsing (`.ipynb`) with multi-language cell support (Python, R, SQL), and Perl XS files (`.xs`).
@@ -182,7 +182,7 @@ The blast-radius analysis never misses an actually impacted file (perfect recall
 | Feature | Details |
 |---------|---------|
 | **Incremental updates** | Re-parses only changed files. Subsequent updates complete in under 2 seconds. |
-| **19 languages + notebooks** | Python, TypeScript/TSX, JavaScript, Vue, Go, Rust, Java, Scala, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++, Dart, R, Perl, Lua, Jupyter/Databricks (.ipynb) |
+| **20 languages + notebooks** | Python, TypeScript/TSX, JavaScript, Vue, Go, Rust, Java, Scala, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++, Dart, R, Perl, Lua, Elixir, Jupyter/Databricks (.ipynb) |
 | **Blast-radius analysis** | Shows exactly which functions, classes, and files are affected by any change |
 | **Auto-update hooks** | Graph updates on every file edit and git commit without manual intervention |
 | **Semantic search** | Optional vector embeddings via sentence-transformers, Google Gemini, or MiniMax |
