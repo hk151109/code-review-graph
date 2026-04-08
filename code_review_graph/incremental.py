@@ -6,6 +6,7 @@ and updates the graph accordingly. Also supports CLI invocation for hooks.
 
 from __future__ import annotations
 
+import concurrent.futures
 import fnmatch
 import hashlib
 import logging
@@ -18,6 +19,10 @@ from typing import Optional
 
 from .graph import GraphStore
 from .parser import CodeParser
+
+_MAX_PARSE_WORKERS = int(os.environ.get(
+    "CRG_PARSE_WORKERS", str(min(os.cpu_count() or 4, 8))
+))
 
 logger = logging.getLogger(__name__)
 
@@ -262,20 +267,18 @@ def collect_all_files(repo_root: Path) -> list[str]:
     return files
 
 
-def find_dependents(store: GraphStore, file_path: str) -> list[str]:
-    """Find files that import from or depend on the given file.
+_MAX_DEPENDENT_HOPS = int(os.environ.get("CRG_DEPENDENT_HOPS", "2"))
+_MAX_DEPENDENT_FILES = 500
 
-    Looks at IMPORTS_FROM edges where target matches the file path.
-    """
-    dependents = set()
-    # Find edges where someone imports from this file
+
+def _single_hop_dependents(store: GraphStore, file_path: str) -> set[str]:
+    """Find files that directly depend on *file_path* (single hop)."""
+    dependents: set[str] = set()
     edges = store.get_edges_by_target(file_path)
     for e in edges:
         if e.kind == "IMPORTS_FROM":
-            # The source is a file path (for IMPORTS_FROM edges)
             dependents.add(e.file_path)
 
-    # Also check for DEPENDS_ON edges
     nodes = store.get_nodes_by_file(file_path)
     for node in nodes:
         for e in store.get_edges_by_target(node.qualified_name):
@@ -283,7 +286,62 @@ def find_dependents(store: GraphStore, file_path: str) -> list[str]:
                 dependents.add(e.file_path)
 
     dependents.discard(file_path)
-    return list(dependents)
+    return dependents
+
+
+def find_dependents(
+    store: GraphStore,
+    file_path: str,
+    max_hops: int = _MAX_DEPENDENT_HOPS,
+) -> list[str]:
+    """Find files that import from or depend on the given file.
+
+    Performs up to *max_hops* iterations of expansion (default 2).
+    Stops early if the total exceeds 500 files.
+    """
+    all_dependents: set[str] = set()
+    visited: set[str] = {file_path}
+    frontier: set[str] = {file_path}
+    for _hop in range(max_hops):
+        next_frontier: set[str] = set()
+        for fp in frontier:
+            deps = _single_hop_dependents(store, fp)
+            new_deps = deps - visited
+            all_dependents.update(new_deps)
+            next_frontier.update(new_deps)
+        visited.update(next_frontier)
+        frontier = next_frontier
+        if not frontier:
+            break
+        if len(all_dependents) > _MAX_DEPENDENT_FILES:
+            logger.warning(
+                "Dependent expansion capped at %d files for %s",
+                len(all_dependents), file_path,
+            )
+            # Truncate to the cap
+            return list(all_dependents)[:_MAX_DEPENDENT_FILES]
+    return list(all_dependents)
+
+
+def _parse_single_file(
+    args: tuple[str, str],
+) -> tuple[str, list, list, str | None, str]:
+    """Parse one file in a worker process.
+
+    Returns ``(rel_path, nodes, edges, error_or_none, file_hash)``.
+    Must be a module-level function so ``ProcessPoolExecutor`` can
+    serialise it across processes.
+    """
+    rel_path, repo_root_str = args
+    abs_path = Path(repo_root_str) / rel_path
+    try:
+        raw = abs_path.read_bytes()
+        fhash = hashlib.sha256(raw).hexdigest()
+        parser = CodeParser()
+        nodes, edges = parser.parse_bytes(abs_path, raw)
+        return (rel_path, nodes, edges, None, fhash)
+    except Exception as e:
+        return (rel_path, [], [], str(e), "")
 
 
 def full_build(repo_root: Path, store: GraphStore) -> dict:
@@ -302,22 +360,47 @@ def full_build(repo_root: Path, store: GraphStore) -> dict:
     errors = []
     file_count = len(files)
 
-    for i, rel_path in enumerate(files, 1):
-        full_path = repo_root / rel_path
-        try:
-            source = full_path.read_bytes()
-            fhash = hashlib.sha256(source).hexdigest()
-            nodes, edges = parser.parse_bytes(full_path, source)
-            store.store_file_nodes_edges(str(full_path), nodes, edges, fhash)
-            total_nodes += len(nodes)
-            total_edges += len(edges)
-        except (OSError, PermissionError) as e:
-            errors.append({"file": rel_path, "error": str(e)})
-        except Exception as e:
-            logger.warning("Error parsing %s: %s", rel_path, e)
-            errors.append({"file": rel_path, "error": str(e)})
-        if i % 50 == 0 or i == file_count:
-            logger.info("Progress: %d/%d files parsed", i, file_count)
+    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+
+    if use_serial or file_count < 8:
+        # Serial fallback (for debugging or tiny repos)
+        for i, rel_path in enumerate(files, 1):
+            full_path = repo_root / rel_path
+            try:
+                source = full_path.read_bytes()
+                fhash = hashlib.sha256(source).hexdigest()
+                nodes, edges = parser.parse_bytes(full_path, source)
+                store.store_file_nodes_edges(str(full_path), nodes, edges, fhash)
+                total_nodes += len(nodes)
+                total_edges += len(edges)
+            except (OSError, PermissionError) as e:
+                errors.append({"file": rel_path, "error": str(e)})
+            except Exception as e:
+                logger.warning("Error parsing %s: %s", rel_path, e)
+                errors.append({"file": rel_path, "error": str(e)})
+            if i % 50 == 0 or i == file_count:
+                logger.info("Progress: %d/%d files parsed", i, file_count)
+    else:
+        # Parallel parsing — store calls remain serial (SQLite single-writer)
+        args_list = [(rel_path, str(repo_root)) for rel_path in files]
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=_MAX_PARSE_WORKERS,
+        ) as executor:
+            for i, (rel_path, nodes, edges, error, fhash) in enumerate(
+                executor.map(_parse_single_file, args_list, chunksize=20), 1,
+            ):
+                if error:
+                    logger.warning("Error parsing %s: %s", rel_path, error)
+                    errors.append({"file": rel_path, "error": error})
+                    continue
+                full_path = repo_root / rel_path
+                store.store_file_nodes_edges(
+                    str(full_path), nodes, edges, fhash,
+                )
+                total_nodes += len(nodes)
+                total_edges += len(edges)
+                if i % 200 == 0 or i == file_count:
+                    logger.info("Progress: %d/%d files parsed", i, file_count)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "full")
@@ -378,35 +461,62 @@ def incremental_update(
     total_edges = 0
     errors = []
 
+    # Separate deleted/unparseable files from files that need re-parsing
+    to_parse: list[str] = []
     for rel_path in all_files:
         if _should_ignore(rel_path, ignore_patterns):
             continue
         abs_path = repo_root / rel_path
         if not abs_path.is_file():
-            # File was deleted
             store.remove_file_data(str(abs_path))
             continue
         if parser.detect_language(abs_path) is None:
             continue
-
+        # Quick hash check to skip unchanged files
         try:
-            source = abs_path.read_bytes()
-            fhash = hashlib.sha256(source).hexdigest()
-            # Check if file actually changed (compare against stored file_hash column)
+            raw = abs_path.read_bytes()
+            fhash = hashlib.sha256(raw).hexdigest()
             existing_nodes = store.get_nodes_by_file(str(abs_path))
             if existing_nodes and existing_nodes[0].file_hash == fhash:
-                # Skip unchanged files (hash match)
                 continue
+        except (OSError, PermissionError):
+            pass
+        to_parse.append(rel_path)
 
-            nodes, edges = parser.parse_bytes(abs_path, source)
-            store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
-            total_nodes += len(nodes)
-            total_edges += len(edges)
-        except (OSError, PermissionError) as e:
-            errors.append({"file": rel_path, "error": str(e)})
-        except Exception as e:
-            logger.warning("Error parsing %s: %s", rel_path, e)
-            errors.append({"file": rel_path, "error": str(e)})
+    use_serial = os.environ.get("CRG_SERIAL_PARSE", "") == "1"
+
+    if use_serial or len(to_parse) < 8:
+        for rel_path in to_parse:
+            abs_path = repo_root / rel_path
+            try:
+                source = abs_path.read_bytes()
+                fhash = hashlib.sha256(source).hexdigest()
+                nodes, edges = parser.parse_bytes(abs_path, source)
+                store.store_file_nodes_edges(str(abs_path), nodes, edges, fhash)
+                total_nodes += len(nodes)
+                total_edges += len(edges)
+            except (OSError, PermissionError) as e:
+                errors.append({"file": rel_path, "error": str(e)})
+            except Exception as e:
+                logger.warning("Error parsing %s: %s", rel_path, e)
+                errors.append({"file": rel_path, "error": str(e)})
+    else:
+        args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=_MAX_PARSE_WORKERS,
+        ) as executor:
+            for rel_path, nodes, edges, error, fhash in executor.map(
+                _parse_single_file, args_list, chunksize=20,
+            ):
+                if error:
+                    logger.warning("Error parsing %s: %s", rel_path, error)
+                    errors.append({"file": rel_path, "error": error})
+                    continue
+                store.store_file_nodes_edges(
+                    str(repo_root / rel_path), nodes, edges, fhash,
+                )
+                total_nodes += len(nodes)
+                total_edges += len(edges)
 
     store.set_metadata("last_updated", time.strftime("%Y-%m-%dT%H:%M:%S"))
     store.set_metadata("last_build_type", "incremental")

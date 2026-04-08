@@ -1,13 +1,16 @@
 """Tests for the incremental graph update module."""
 
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch  # noqa: F401 – patch used in tests
 
 from code_review_graph.graph import GraphStore
 from code_review_graph.incremental import (
     _is_binary,
     _load_ignore_patterns,
+    _parse_single_file,
     _should_ignore,
+    _single_hop_dependents,
+    find_dependents,
     find_project_root,
     find_repo_root,
     full_build,
@@ -234,5 +237,165 @@ class TestIncrementalUpdate:
             # File should have been removed from graph
             nodes = store.get_nodes_by_file(str(tmp_path / "old.py"))
             assert len(nodes) == 0
+        finally:
+            store.close()
+
+
+class TestParallelParsing:
+    def test_parse_single_file(self, tmp_path):
+        py_file = tmp_path / "single.py"
+        py_file.write_text("def foo():\n    pass\n")
+        rel_path, nodes, edges, error, fhash = _parse_single_file(
+            ("single.py", str(tmp_path))
+        )
+        assert rel_path == "single.py"
+        assert error is None
+        assert len(nodes) > 0
+        assert fhash != ""
+
+    def test_parse_single_file_missing(self, tmp_path):
+        rel_path, nodes, edges, error, fhash = _parse_single_file(
+            ("missing.py", str(tmp_path))
+        )
+        assert error is not None
+        assert nodes == []
+        assert edges == []
+
+    def test_parallel_build_produces_same_results(self, tmp_path):
+        """Serial and parallel builds produce identical node/edge counts."""
+        (tmp_path / ".git").mkdir()
+        # Create several Python files
+        for i in range(10):
+            (tmp_path / f"mod{i}.py").write_text(
+                f"def func_{i}():\n    return {i}\n\n"
+                f"class Cls{i}:\n    pass\n"
+            )
+
+        tracked = [f"mod{i}.py" for i in range(10)]
+        mock_target = "code_review_graph.incremental.get_all_tracked_files"
+
+        # Serial build
+        db_serial = tmp_path / "serial.db"
+        store_serial = GraphStore(db_serial)
+        try:
+            with patch(mock_target, return_value=tracked):
+                with patch.dict("os.environ", {"CRG_SERIAL_PARSE": "1"}):
+                    result_serial = full_build(tmp_path, store_serial)
+            serial_nodes = result_serial["total_nodes"]
+            serial_edges = result_serial["total_edges"]
+            serial_files = result_serial["files_parsed"]
+        finally:
+            store_serial.close()
+
+        # Parallel build
+        db_parallel = tmp_path / "parallel.db"
+        store_parallel = GraphStore(db_parallel)
+        try:
+            with patch(mock_target, return_value=tracked):
+                with patch.dict("os.environ", {"CRG_SERIAL_PARSE": ""}):
+                    result_parallel = full_build(tmp_path, store_parallel)
+            parallel_nodes = result_parallel["total_nodes"]
+            parallel_edges = result_parallel["total_edges"]
+            parallel_files = result_parallel["files_parsed"]
+        finally:
+            store_parallel.close()
+
+        assert serial_files == parallel_files
+        assert serial_nodes == parallel_nodes
+        assert serial_edges == parallel_edges
+
+
+class TestMultiHopDependents:
+    """Tests for N-hop dependent discovery."""
+
+    def _make_chain_store(self, tmp_path):
+        """Build A -> B -> C chain in the graph."""
+        from code_review_graph.parser import EdgeInfo, NodeInfo
+
+        db_path = tmp_path / "chain.db"
+        store = GraphStore(db_path)
+        for name, path in [("a", "/a.py"), ("b", "/b.py"), ("c", "/c.py")]:
+            store.upsert_node(NodeInfo(
+                kind="File", name=path, file_path=path,
+                line_start=1, line_end=10, language="python",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name=f"func_{name}", file_path=path,
+                line_start=2, line_end=8, language="python",
+            ))
+        # A imports B, B imports C
+        store.upsert_edge(EdgeInfo(
+            kind="IMPORTS_FROM", source="/a.py::func_a",
+            target="/b.py::func_b", file_path="/a.py", line=1,
+        ))
+        store.upsert_edge(EdgeInfo(
+            kind="IMPORTS_FROM", source="/b.py::func_b",
+            target="/c.py::func_c", file_path="/b.py", line=1,
+        ))
+        store.commit()
+        return store
+
+    def test_single_hop_finds_direct_only(self, tmp_path):
+        store = self._make_chain_store(tmp_path)
+        try:
+            deps = _single_hop_dependents(store, "/c.py")
+            assert "/b.py" in deps
+            assert "/a.py" not in deps
+        finally:
+            store.close()
+
+    def test_one_hop_finds_b_not_a(self, tmp_path):
+        store = self._make_chain_store(tmp_path)
+        try:
+            deps = find_dependents(store, "/c.py", max_hops=1)
+            assert "/b.py" in deps
+            assert "/a.py" not in deps
+        finally:
+            store.close()
+
+    def test_two_hops_finds_b_and_a(self, tmp_path):
+        store = self._make_chain_store(tmp_path)
+        try:
+            deps = find_dependents(store, "/c.py", max_hops=2)
+            assert "/b.py" in deps
+            assert "/a.py" in deps
+        finally:
+            store.close()
+
+    def test_cap_triggers_on_many_files(self, tmp_path):
+        """The 500-file cap prevents runaway expansion."""
+        from code_review_graph.parser import EdgeInfo, NodeInfo
+
+        db_path = tmp_path / "big.db"
+        store = GraphStore(db_path)
+        try:
+            # Hub node that many files depend on
+            store.upsert_node(NodeInfo(
+                kind="File", name="/hub.py", file_path="/hub.py",
+                line_start=1, line_end=10, language="python",
+            ))
+            store.upsert_node(NodeInfo(
+                kind="Function", name="hub_func", file_path="/hub.py",
+                line_start=2, line_end=8, language="python",
+            ))
+            for i in range(600):
+                path = f"/dep{i}.py"
+                store.upsert_node(NodeInfo(
+                    kind="File", name=path, file_path=path,
+                    line_start=1, line_end=10, language="python",
+                ))
+                store.upsert_node(NodeInfo(
+                    kind="Function", name=f"func_{i}", file_path=path,
+                    line_start=2, line_end=8, language="python",
+                ))
+                store.upsert_edge(EdgeInfo(
+                    kind="IMPORTS_FROM", source=f"{path}::func_{i}",
+                    target="/hub.py::hub_func", file_path=path, line=1,
+                ))
+            store.commit()
+
+            # Even with high max_hops, cap should limit results
+            deps = find_dependents(store, "/hub.py", max_hops=5)
+            assert len(deps) <= 500
         finally:
             store.close()
